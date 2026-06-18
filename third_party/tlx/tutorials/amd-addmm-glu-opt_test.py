@@ -859,6 +859,195 @@ def run_kernel_persistent(a, b, bias, y, out, cfg, num_cus):
     )
 
 
+# Tile-major packed B persistent kernel.
+#
+# pack_b() repacks b[K, N] into b_packed[K_tiles, N_tiles, BN, BK] with BK
+# innermost contiguous.  Each [BN, BK] tile is a flat contiguous block in
+# memory so:
+#   - global loads are coalesced (BK fp16 = 64 B = one cache line per N-row)
+#   - LDS is stored [BN, BK] K-contiguous, so local_trans gives plain ds_read_b128
+#
+@triton.jit
+def tlx_addmm_glu_kernel_persistent_packed(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    y_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    sa0,
+    sa1,
+    spbk,
+    sy0,
+    sy1,
+    sc0,
+    sc1,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    XCD_CHUNK: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+):
+    NUM_BUFFERS: tl.constexpr = 3
+
+    start_pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_n_local = tl.arange(0, BLOCK_SIZE_N)
+
+    smemA = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tlx.dtype_of(a_ptr), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_SIZE_N, BLOCK_SIZE_K), tlx.dtype_of(b_ptr), NUM_BUFFERS)
+
+    # b_ptr points to b_packed[K_tiles, N_tiles, BN, BK].
+    # Each K-tile stride is spbk = N_tiles * BN * BK elements.
+    # Within a K-tile, each N-tile is a flat [BN * BK] contiguous block.
+    b_within = offs_n_local[:, None] * BLOCK_SIZE_K + offs_k[None, :]
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_PROGRAMS):
+        swizzled = chiplet_transform_chunked(tile_id, num_tiles, NUM_XCDS, XCD_CHUNK)
+
+        group_id = swizzled // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((swizzled % num_pid_in_group) % group_size_m)
+        pid_n = (swizzled % num_pid_in_group) // group_size_m
+
+        offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        a_base_off = offs_m[:, None] * sa0
+
+        # Pointer to the packed B tile for this (K_tile=0, N_tile=pid_n)
+        b_tile_ptr = b_ptr + pid_n * (BLOCK_SIZE_N * BLOCK_SIZE_K)
+
+        k_iters = tl.cdiv(K, BLOCK_SIZE_K)
+
+        # Prologue: issue NUM_BUFFERS async loads
+        tok_a = tlx.async_load(a_ptr + a_base_off + offs_k[None, :] * sa1,
+                               tlx.local_view(smemA, 0), mask=offs_k[None, :] < K)
+        tok_b = tlx.async_load(b_tile_ptr + b_within, tlx.local_view(smemB, 0))
+        tlx.async_load_commit_group([tok_a, tok_b])
+
+        tok_a = tlx.async_load(a_ptr + a_base_off + (BLOCK_SIZE_K + offs_k[None, :]) * sa1,
+                               tlx.local_view(smemA, 1), mask=offs_k[None, :] < K - BLOCK_SIZE_K)
+        tok_b = tlx.async_load(b_tile_ptr + spbk + b_within, tlx.local_view(smemB, 1))
+        tlx.async_load_commit_group([tok_a, tok_b])
+
+        tok_a = tlx.async_load(a_ptr + a_base_off + (BLOCK_SIZE_K * 2 + offs_k[None, :]) * sa1,
+                               tlx.local_view(smemA, 2), mask=offs_k[None, :] < K - BLOCK_SIZE_K * 2)
+        tok_b = tlx.async_load(b_tile_ptr + spbk * 2 + b_within, tlx.local_view(smemB, 2))
+        tlx.async_load_commit_group([tok_a, tok_b])
+
+        tlx.async_load_wait_group(1)
+
+        a_tile = tlx.local_load(tlx.local_view(smemA, 0), relaxed=True)
+        b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, 0)), relaxed=True)
+
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        for i in tl.range(0, k_iters - NUM_BUFFERS, loop_unroll_factor=0):
+            prefetch_buf = i % NUM_BUFFERS
+            next_buf = (i + 1) % NUM_BUFFERS
+            k_prefetch = (i + NUM_BUFFERS) * BLOCK_SIZE_K
+
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                tok_a = tlx.async_load(a_ptr + a_base_off + (k_prefetch + offs_k[None, :]) * sa1,
+                                       tlx.local_view(smemA, prefetch_buf),
+                                       mask=offs_k[None, :] < K - k_prefetch)
+                tok_b = tlx.async_load(b_tile_ptr + spbk * (i + NUM_BUFFERS) + b_within,
+                                       tlx.local_view(smemB, prefetch_buf))
+
+                tlx.async_load_commit_group([tok_a, tok_b])
+
+                a_tile = tlx.local_load(tlx.local_view(smemA, next_buf), relaxed=True)
+                b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, next_buf)), relaxed=True)
+
+            tlx.async_load_wait_group(1)
+
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+        tlx.async_load_wait_group(0)
+
+        for i in tl.static_range(0, NUM_BUFFERS - 1):
+            buf = (k_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
+            a_tile = tlx.local_load(tlx.local_view(smemA, buf), relaxed=True)
+            b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)), relaxed=True)
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+        bias = tl.load(bias_ptr + offs_n).to(tl.float32)
+        y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+        y = tl.load(y_ptrs, cache_modifier=".cs").to(tl.float32)
+        x = acc + bias[None, :]
+        out = x + x * y
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        c_ptrs = c_ptr + offs_cm[:, None] * sc0 + offs_cn[None, :] * sc1
+        tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=c_mask, cache_modifier=".cs")
+
+
+def pack_b(b, BK, BN):
+    """Repack b[K, N] -> b_packed[K_tiles, N_tiles, BN, BK] with BK contiguous."""
+    K, N = b.shape
+    N_tiles = triton.cdiv(N, BN)
+    N_padded = N_tiles * BN
+    if N_padded > N:
+        pad = torch.zeros(K, N_padded - N, device=b.device, dtype=b.dtype)
+        b = torch.cat([b, pad], dim=1)
+    K_tiles = K // BK
+    return b.reshape(K_tiles, BK, N_tiles, BN).permute(0, 2, 3, 1).contiguous()
+
+
+def run_kernel_persistent_packed(a, b_packed, bias, y, out, cfg, num_programs):
+    M, K = a.shape
+    N = out.shape[1]
+    grid = (min(num_programs, triton.cdiv(M, cfg["BLOCK_SIZE_M"]) * triton.cdiv(N, cfg["BLOCK_SIZE_N"])), )
+    return tlx_addmm_glu_kernel_persistent_packed[grid](
+        a,
+        b_packed,
+        bias,
+        y,
+        out,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b_packed.stride(0),
+        y.stride(0),
+        y.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_SIZE_M=cfg["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=cfg["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=cfg["BLOCK_SIZE_K"],
+        GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
+        NUM_XCDS=NUM_XCDS,
+        XCD_CHUNK=cfg["XCD_CHUNK"],
+        NUM_PROGRAMS=grid[0],
+        num_warps=cfg["num_warps"],
+        num_stages=1,
+        matrix_instr_nonkdim=cfg.get("matrix_instr_nonkdim", 0),
+        waves_per_eu=cfg.get("waves_per_eu", 0),
+    )
+
+
+_BPACKED_CACHE = {}
+
+
 def run_kernel_simple_async(a, b, bias, y, out, cfg):
     M, K = a.shape
     _, N = b.shape
@@ -1065,7 +1254,22 @@ def run_persistent(a, b, bias, y):
     K = b.shape[0]
     out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=torch.float16)
     num_cus = torch.cuda.get_device_properties(a.device).multi_processor_count
-    run_kernel_persistent(a, b, bias, y, out, PERSISTENT_BEST_CONFIG[K], num_cus)
+    run_kernel_persistent(a, b, bias, y, out, PERSISTENT_BEST_CONFIG[K], 2 * num_cus)
+    return out
+
+
+def run_persistent_packed(a, b, bias, y):
+    K = b.shape[0]
+    cfg = PERSISTENT_BEST_CONFIG[K]
+    BK, BN = cfg["BLOCK_SIZE_K"], cfg["BLOCK_SIZE_N"]
+    key = (id(b), b.shape, b.data_ptr(), BK, BN)
+    b_packed = _BPACKED_CACHE.get(key)
+    if b_packed is None:
+        b_packed = pack_b(b, BK, BN)
+        _BPACKED_CACHE[key] = b_packed
+    out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=torch.float16)
+    num_cus = torch.cuda.get_device_properties(a.device).multi_processor_count
+    run_kernel_persistent_packed(a, b_packed, bias, y, out, cfg, 2 * num_cus)
     return out
 
 
@@ -1082,6 +1286,7 @@ KERNEL_REGISTRY = {
     "tlx_optimized_async": run_optimized_async,
     "tlx_optimized": run_optimized,
     "tlx_persistent": run_persistent,
+    "tlx_persistent_packed": run_persistent_packed,
 }
 
 
@@ -1131,6 +1336,9 @@ PERF_BASELINE_TFLOPS = {
     ("tlx_persistent", 256): 298,
     ("tlx_persistent", 512): 449,
     ("tlx_persistent", 1024): 613,
+    ("tlx_persistent_packed", 256): 298,
+    ("tlx_persistent_packed", 512): 438,
+    ("tlx_persistent_packed", 1024): 615,
 }
 
 
